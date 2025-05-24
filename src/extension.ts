@@ -43,7 +43,10 @@ export function activate(context: vscode.ExtensionContext) {
             // 3. Parse the patch file to extract file changes
             const fileChanges = parsePatchFile(patchContent);
             
-            // 4. For each file change, show diff and prompt for confirmation
+            // 4. Filter out unsupported files and prepare for batch processing
+            const supportedChanges: Array<{change: FileChange, targetFilePath: string, tempFilePath: string, newContent: string}> = [];
+            const deletedFiles: Array<{change: FileChange, targetFilePath: string}> = [];
+            
             for (const change of fileChanges) {
                 const targetFilePath = path.join(workspaceRoot, change.filePath);
                 
@@ -60,24 +63,13 @@ export function activate(context: vscode.ExtensionContext) {
                 
                 const targetFileExists = fs.existsSync(targetFilePath);
                 
-                // Handle deleted files
+                // Handle deleted files separately
                 if (change.isDeleted) {
                     if (targetFileExists) {
-                        const deleteFile = await vscode.window.showInformationMessage(
-                            `Delete file ${change.filePath}?`,
-                            'Yes', 'No'
-                        );
-                        
-                        if (deleteFile === 'Yes') {
-                            fs.unlinkSync(targetFilePath);
-                            vscode.window.showInformationMessage(`Deleted ${change.filePath}`);
-                        }
+                        deletedFiles.push({ change, targetFilePath });
                     }
                     continue;
                 }
-                
-                // Create temporary file with the changes applied
-                const tempFilePath = path.join(workspaceRoot, `.temp_${path.basename(change.filePath)}`);
                 
                 // Skip if target is a directory
                 if (targetFileExists && fs.statSync(targetFilePath).isDirectory()) {
@@ -98,6 +90,9 @@ export function activate(context: vscode.ExtensionContext) {
                 // Apply changes to create new content
                 const newContent = applyPatchToContent(originalContent, change);
                 
+                // Create temporary file with the changes applied
+                const tempFilePath = path.join(workspaceRoot, `.temp_${path.basename(change.filePath)}`);
+                
                 // Ensure temp directory exists
                 const tempDir = path.dirname(tempFilePath);
                 if (!fs.existsSync(tempDir)) {
@@ -106,61 +101,137 @@ export function activate(context: vscode.ExtensionContext) {
                 
                 try {
                     fs.writeFileSync(tempFilePath, newContent);
+                    supportedChanges.push({ change, targetFilePath, tempFilePath, newContent });
                 } catch (error) {
                     vscode.window.showErrorMessage(`Error creating temp file for ${change.filePath}: ${error instanceof Error ? error.message : String(error)}`);
                     continue;
                 }
-                
-                // 5. Show diff using VS Code's diff editor
-                const originalUri = targetFileExists 
-                    ? vscode.Uri.file(targetFilePath)
-                    : vscode.Uri.file(tempFilePath).with({ scheme: 'untitled' });
-                const modifiedUri = vscode.Uri.file(tempFilePath);
-                
-                const title = `${change.filePath} (Git Patch Preview)`;
-                
-                try {
-                    await vscode.commands.executeCommand('vscode.diff', 
-                        originalUri, 
-                        modifiedUri,
-                        title
-                    );
-                } catch (error) {
-                    vscode.window.showErrorMessage(`Error showing diff for ${change.filePath}: ${error instanceof Error ? error.message : String(error)}`);
-                    continue;
+            }
+            
+            // 5. Show summary and ask for single approval
+            const totalFiles = supportedChanges.length + deletedFiles.length;
+            if (totalFiles === 0) {
+                vscode.window.showInformationMessage('No supported files found in patch');
+                return;
+            }
+            
+            const fileList = [
+                ...supportedChanges.map(item => item.change.filePath),
+                ...deletedFiles.map(item => `${item.change.filePath} (delete)`)
+            ];
+            
+            const applyPatch = await vscode.window.showInformationMessage(
+                `Apply patch to ${totalFiles} file(s)?\n\nFiles to be modified:\n${fileList.join('\n')}`,
+                'Yes', 'No', 'Preview Changes'
+            );
+            
+            if (applyPatch === 'No') {
+                // Clean up temp files
+                for (const item of supportedChanges) {
+                    try {
+                        if (fs.existsSync(item.tempFilePath)) {
+                            fs.unlinkSync(item.tempFilePath);
+                        }
+                    } catch (error) {
+                        console.log(`Error cleaning up temp file: ${error instanceof Error ? error.message : String(error)}`);
+                    }
+                }
+                return;
+            }
+            
+            // 6. If user wants to preview, show diffs for all files
+            if (applyPatch === 'Preview Changes') {
+                for (const item of supportedChanges) {
+                    const targetFileExists = fs.existsSync(item.targetFilePath);
+                    const originalUri = targetFileExists 
+                        ? vscode.Uri.file(item.targetFilePath)
+                        : vscode.Uri.file(item.tempFilePath).with({ scheme: 'untitled' });
+                    const modifiedUri = vscode.Uri.file(item.tempFilePath);
+                    
+                    const title = `${item.change.filePath} (Git Patch Preview)`;
+                    
+                    try {
+                        await vscode.commands.executeCommand('vscode.diff', 
+                            originalUri, 
+                            modifiedUri,
+                            title,
+                            { preview: false, viewColumn: vscode.ViewColumn.Beside } // Open in a new column and keep it
+                        );
+                    } catch (error) {
+                        vscode.window.showErrorMessage(`Error showing diff for ${item.change.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+                    }
                 }
                 
-                // 6. Prompt user to apply this change
-                const applyChange = await vscode.window.showInformationMessage(
-                    `Apply changes to ${change.filePath}?`,
+                // Ask again after preview
+                const applyAfterPreview = await vscode.window.showInformationMessage(
+                    `Apply patch to ${totalFiles} file(s)?`,
                     'Yes', 'No'
                 );
                 
-                if (applyChange === 'Yes') {
-                    try {
-                        // Create directory if it doesn't exist (for new files)
-                        const targetDir = path.dirname(targetFilePath);
-                        if (!fs.existsSync(targetDir)) {
-                            fs.mkdirSync(targetDir, { recursive: true });
+                if (applyAfterPreview !== 'Yes') {
+                    // Clean up temp files
+                    for (const item of supportedChanges) {
+                        try {
+                            if (fs.existsSync(item.tempFilePath)) {
+                                fs.unlinkSync(item.tempFilePath);
+                            }
+                        } catch (error) {
+                            console.log(`Error cleaning up temp file: ${error instanceof Error ? error.message : String(error)}`);
                         }
-                        
-                        // Apply changes
-                        fs.writeFileSync(targetFilePath, newContent);
-                        vscode.window.showInformationMessage(`Changes applied to ${change.filePath}`);
-                    } catch (error) {
-                        vscode.window.showErrorMessage(`Error applying changes to ${change.filePath}: ${error instanceof Error ? error.message : String(error)}`);
                     }
+                    return;
+                }
+            }
+            
+            // 7. Apply all changes
+            let successCount = 0;
+            let errorCount = 0;
+            
+            // Apply file modifications
+            for (const item of supportedChanges) {
+                try {
+                    // Create directory if it doesn't exist (for new files)
+                    const targetDir = path.dirname(item.targetFilePath);
+                    if (!fs.existsSync(targetDir)) {
+                        fs.mkdirSync(targetDir, { recursive: true });
+                    }
+                    
+                    // Apply changes
+                    fs.writeFileSync(item.targetFilePath, item.newContent);
+                    successCount++;
+                } catch (error) {
+                    vscode.window.showErrorMessage(`Error applying changes to ${item.change.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+                    errorCount++;
                 }
                 
                 // Clean up temporary file
                 try {
-                    if (fs.existsSync(tempFilePath)) {
-                        fs.unlinkSync(tempFilePath);
+                    if (fs.existsSync(item.tempFilePath)) {
+                        fs.unlinkSync(item.tempFilePath);
                     }
                 } catch (error) {
                     console.log(`Error cleaning up temp file: ${error instanceof Error ? error.message : String(error)}`);
                 }
             }
+            
+            // Apply file deletions
+            for (const item of deletedFiles) {
+                try {
+                    fs.unlinkSync(item.targetFilePath);
+                    successCount++;
+                } catch (error) {
+                    vscode.window.showErrorMessage(`Error deleting ${item.change.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+                    errorCount++;
+                }
+            }
+            
+            // Show final result
+            if (errorCount === 0) {
+                vscode.window.showInformationMessage(`Patch applied successfully to ${successCount} file(s)`);
+            } else {
+                vscode.window.showWarningMessage(`Patch applied to ${successCount} file(s) with ${errorCount} error(s)`);
+            }
+            
         } catch (error) {
             vscode.window.showErrorMessage(`Error applying patch: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -271,8 +342,10 @@ interface FileChange {
     isNew: boolean;
     isDeleted: boolean;
     hunks: {
-        startLine: number;
-        lineCount: number;
+        oldStartLine: number;
+        oldLineCount: number;
+        newStartLine: number;
+        newLineCount: number;
         content: string;
     }[];
 }
@@ -288,7 +361,9 @@ function parsePatchFile(patchContent: string): FileChange[] {
     for (let i = 1; i < diffFiles.length; i++) {
         const diffContent = diffFiles[i];
         const lines = diffContent.split('\n');
-        
+        // Remove last line from lines (often an empty line or diff metadata)
+        lines.pop();
+
         // Extract file path
         let filePathMatch = lines[0].match(/a\/(.*) b\/(.*)/);
         
@@ -366,7 +441,7 @@ function parsePatchFile(patchContent: string): FileChange[] {
         
         // Find the hunks
         let inHunk = false;
-        let currentHunk = { startLine: 0, lineCount: 0, content: '' };
+        let currentHunk: FileChange['hunks'][0] = { oldStartLine: 0, oldLineCount: 0, newStartLine: 0, newLineCount: 0, content: '' };
         let hunkHeaderMatch: RegExpMatchArray | null = null;
         
         for (let j = 1; j < lines.length; j++) {
@@ -375,6 +450,8 @@ function parsePatchFile(patchContent: string): FileChange[] {
             if (line.startsWith('@@')) {
                 // Start of a new hunk
                 if (inHunk) {
+                    // Remove trailing newline before pushing
+                    currentHunk.content = currentHunk.content.replace(/\n$/, '');
                     hunks.push({ ...currentHunk });
                 }
                 
@@ -384,12 +461,16 @@ function parsePatchFile(patchContent: string): FileChange[] {
                 hunkHeaderMatch = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
                 if (hunkHeaderMatch) {
                     inHunk = true;
-                    const startLine = parseInt(hunkHeaderMatch[3], 10);
-                    const lineCount = hunkHeaderMatch[4] ? parseInt(hunkHeaderMatch[4], 10) : 1;
+                    const oldStartLine = parseInt(hunkHeaderMatch[1], 10);
+                    const oldLineCount = hunkHeaderMatch[2] ? parseInt(hunkHeaderMatch[2], 10) : 1;
+                    const newStartLine = parseInt(hunkHeaderMatch[3], 10);
+                    const newLineCount = hunkHeaderMatch[4] ? parseInt(hunkHeaderMatch[4], 10) : 1;
                     
                     currentHunk = {
-                        startLine,
-                        lineCount,
+                        oldStartLine,
+                        oldLineCount,
+                        newStartLine,
+                        newLineCount,
                         content: ''
                     };
                 }
@@ -401,6 +482,7 @@ function parsePatchFile(patchContent: string): FileChange[] {
         
         // Add the last hunk
         if (inHunk) {
+            currentHunk.content = currentHunk.content.replace(/\n$/, '');
             hunks.push({ ...currentHunk });
         }
         
@@ -421,22 +503,27 @@ function applyPatchToContent(originalContent: string, change: FileChange): strin
     let lines = originalContent.split('\n');
     
     // Apply hunks in reverse order (from bottom to top) to avoid line number shifts
-    const sortedHunks = [...change.hunks].sort((a, b) => b.startLine - a.startLine);
+    const sortedHunks = [...change.hunks].sort((a, b) => b.oldStartLine - a.oldStartLine); 
     
     for (const hunk of sortedHunks) {
-        const { startLine, content } = hunk;
+        const { oldStartLine, oldLineCount, content } = hunk;
         
-        // Parse the hunk content to get actual changes
         const hunkLines = content.split('\n');
-        const newLines = hunkLines
-            .filter(line => !line.startsWith('-') && !line.startsWith('\\'))
-            .map(line => line.startsWith('+') ? line.substring(1) : line);
-        
-        // Replace lines in original content
-        const before = lines.slice(0, startLine - 1);
-        const after = lines.slice(startLine - 1 + hunkLines.filter(line => !line.startsWith('+')).length);
-        
-        lines = [...before, ...newLines, ...after];
+        const linesToInsert: string[] = [];
+
+        for (const hunkLine of hunkLines) {
+            if (hunkLine.startsWith('+')) {
+                linesToInsert.push(hunkLine.substring(1)); // Add new line
+            } else if (hunkLine.startsWith('-') || hunkLine.startsWith('\\')) {
+                // This line is deleted from the original, so we don't add it to linesToInsert
+            } else { // Context line (starts with ' ')
+                linesToInsert.push(hunkLine.substring(1)); // Keep context line
+            }
+        }
+
+        // The splice operation should remove 'oldLineCount' lines from the original content
+        // starting at 'oldStartLine - 1' and insert 'linesToInsert'.
+        lines.splice(oldStartLine - 1, oldLineCount, ...linesToInsert);
     }
     
     return lines.join('\n');
